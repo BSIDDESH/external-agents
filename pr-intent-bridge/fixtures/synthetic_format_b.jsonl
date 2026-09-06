@@ -1,0 +1,8 @@
+# SYNTHETIC TEST FIXTURE - Not an official event fixture
+# This is a hand-crafted test fixture for validating Format B parsing.
+# The mentor fixture was not available at time of writing.
+{"event": "session_start", "session_id": "test-session-123", "agent": "opencode", "timestamp": "2026-09-06T12:00:00Z"}
+{"event": "prompt", "text": "Add a new feature to parse JSONL checkpoint files and extract user intent"}
+{"event": "file_edit", "path": "pr-intent-bridge/extract_checkpoint.py"}
+{"event": "custom_tool_x", "data": "this is an unknown event type that should be skipped"}
+{"event": "session_end", "session_id": "test-session-123", "timestamp": "2026-09-06T12:30:00Z"}

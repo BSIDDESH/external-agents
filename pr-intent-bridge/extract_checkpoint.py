@@ -2,9 +2,13 @@
 """
 Extract checkpoint data for a given commit SHA from the entire/checkpoints/v1 branch.
 
-Reads checkpoint metadata.json and prompt.txt using git commands without checking out
-the checkpoint branch. Matches checkpoints to commits by searching checkpoint branch
-commits for the target commit SHA in their messages.
+Supports two checkpoint formats:
+- Format A (legacy): metadata.json + prompt.txt files
+- Format B (new): single checkpoint.jsonl with event stream
+
+Reads checkpoint data using git commands without checking out the checkpoint branch.
+Matches checkpoints to commits by searching checkpoint branch commits for the target
+commit SHA in their messages.
 """
 
 import json
@@ -87,8 +91,6 @@ def list_checkpoint_ids(repo_path: str) -> list[str]:
     out = run_git(["ls-tree", "-r", "--name-only", CHECKPOINT_BRANCH], repo_path)
     if not out:
         return []
-    # Paths are like "ab/c123def456/metadata.json" or "ab/c123def456/0/prompt.txt"
-    # Extract unique checkpoint IDs (first two path components)
     ids = set()
     for line in out.splitlines():
         parts = line.split("/")
@@ -104,60 +106,12 @@ def read_blob(repo_path: str, blob_path: str) -> str:
     return run_git(["show", f"{CHECKPOINT_BRANCH}:{blob_path}"], repo_path)
 
 
-def parse_checkpoint_metadata(repo_path: str, checkpoint_id: str) -> CheckpointMetadata:
-    """Read and parse checkpoint-level metadata.json."""
-    path = f"{checkpoint_path(checkpoint_id)}/metadata.json"
-    raw = read_blob(repo_path, path)
-    data = json.loads(raw)
-    return CheckpointMetadata(
-        cli_version=data.get("cli_version", ""),
-        checkpoint_id=data.get("checkpoint_id", ""),
-        strategy=data.get("strategy", ""),
-        branch=data.get("branch", ""),
-        checkpoints_count=data.get("checkpoints_count", 0),
-        files_touched=data.get("files_touched", []),
-        sessions=[
-            SessionRef(
-                metadata=s.get("metadata", ""),
-                transcript=s.get("transcript", ""),
-                context=s.get("context", ""),
-                content_hash=s.get("content_hash", ""),
-                prompt=s.get("prompt", ""),
-            )
-            for s in data.get("sessions", [])
-        ],
-        token_usage=TokenUsage(**data.get("token_usage", {})),
-    )
-
-
-def parse_session_metadata(repo_path: str, checkpoint_id: str, session_index: int) -> SessionMetadata:
-    """Read and parse session-level metadata.json."""
-    path = f"{checkpoint_path(checkpoint_id)}/{session_index}/metadata.json"
-    raw = read_blob(repo_path, path)
-    data = json.loads(raw)
-    return SessionMetadata(
-        cli_version=data.get("cli_version", ""),
-        checkpoint_id=data.get("checkpoint_id", ""),
-        session_id=data.get("session_id", ""),
-        strategy=data.get("strategy", ""),
-        created_at=data.get("created_at", ""),
-        branch=data.get("branch", ""),
-        agent=data.get("agent", ""),
-        checkpoints_count=data.get("checkpoints_count", 0),
-        files_touched=data.get("files_touched", []),
-        token_usage=TokenUsage(**data.get("token_usage", {})),
-        initial_attribution=data.get("initial_attribution", {}),
-        transcript_path=data.get("transcript_path", ""),
-    )
-
-
-def read_prompt(repo_path: str, checkpoint_id: str, session_index: int) -> str:
-    """Read prompt.txt for a session."""
-    path = f"{checkpoint_path(checkpoint_id)}/{session_index}/prompt.txt"
+def try_read_blob(repo_path: str, blob_path: str) -> Optional[str]:
+    """Read a blob from the checkpoint branch, return None if not found."""
     try:
-        return read_blob(repo_path, path)
+        return read_blob(repo_path, blob_path)
     except RuntimeError:
-        return ""
+        return None
 
 
 def find_checkpoint_for_commit(commit_sha: str, repo_path: str) -> Optional[str]:
@@ -167,7 +121,6 @@ def find_checkpoint_for_commit(commit_sha: str, repo_path: str) -> Optional[str]
     Strategy: Search the checkpoint branch log for commits that mention the commit SHA.
     Checkpoint branch commits typically include the original commit SHA in their message.
     """
-    # Search checkpoint branch log for the commit SHA
     try:
         out = run_git(
             ["log", CHECKPOINT_BRANCH, "--grep", commit_sha, "--oneline", "--all-match"],
@@ -177,21 +130,16 @@ def find_checkpoint_for_commit(commit_sha: str, repo_path: str) -> Optional[str]
         out = ""
 
     if out:
-        # The log message should contain the checkpoint ID
         for line in out.splitlines():
             parts = line.split()
             if len(parts) >= 2:
-                # Look for 12-char hex in the message
                 for part in parts:
                     if len(part) == 12 and all(c in "0123456789abcdef" for c in part.lower()):
                         return part.lower()
 
-    # Fallback: if no direct match, get the latest checkpoint on the branch
-    # (assumes checkpoint branch tracks the default branch)
     try:
         out = run_git(["log", CHECKPOINT_BRANCH, "--oneline", "-1"], repo_path)
         if out:
-            # Extract checkpoint ID from the latest checkpoint commit message
             for part in out.split():
                 if len(part) == 12 and all(c in "0123456789abcdef" for c in part.lower()):
                     return part.lower()
@@ -201,47 +149,184 @@ def find_checkpoint_for_commit(commit_sha: str, repo_path: str) -> Optional[str]
     return None
 
 
-def get_checkpoint_for_commit(commit_sha: str, repo_path: str) -> Optional[dict]:
+def detect_format(commit_sha: str, repo_path: str) -> Optional[str]:
     """
-    Get checkpoint data for a commit SHA.
+    Detect checkpoint format for a commit.
 
-    Returns a dict with:
-    - checkpoint_id
-    - prompt (from first session)
-    - files_touched (from checkpoint metadata)
-    - session_count
-    - strategy
-    - branch
-    Or None if not found.
+    Returns:
+        "a" if Format A (metadata.json + prompt.txt) exists
+        "b" if Format B (checkpoint.jsonl) exists
+        None if no checkpoint found for commit
     """
     checkpoint_id = find_checkpoint_for_commit(commit_sha, repo_path)
     if not checkpoint_id:
         return None
 
-    meta = parse_checkpoint_metadata(repo_path, checkpoint_id)
+    cp_path = checkpoint_path(checkpoint_id)
 
-    # Get prompt from first session (index 0)
-    prompt = ""
-    session_meta = None
-    if meta.sessions:
-        prompt = read_prompt(repo_path, checkpoint_id, 0)
-        try:
-            session_meta = parse_session_metadata(repo_path, checkpoint_id, 0)
-        except RuntimeError:
-            pass
+    format_a_metadata = try_read_blob(repo_path, f"{cp_path}/metadata.json")
+    if format_a_metadata is not None:
+        return "a"
+
+    format_b_jsonl = try_read_blob(repo_path, f"{cp_path}/checkpoint.jsonl")
+    if format_b_jsonl is not None:
+        return "b"
+
+    return None
+
+
+def parse_format_a(commit_sha: str, repo_path: str) -> dict:
+    """Parse Format A: metadata.json + prompt.txt structure."""
+    warnings = []
+    checkpoint_id = find_checkpoint_for_commit(commit_sha, repo_path)
+    if not checkpoint_id:
+        return {
+            "prompt_text": "",
+            "files_touched": [],
+            "complete": False,
+            "format_version": "a",
+            "warnings": ["No checkpoint found for commit"],
+        }
+
+    cp_path = checkpoint_path(checkpoint_id)
+
+    meta_raw = try_read_blob(repo_path, f"{cp_path}/metadata.json")
+    if meta_raw is None:
+        return {
+            "prompt_text": "",
+            "files_touched": [],
+            "complete": False,
+            "format_version": "a",
+            "warnings": [f"metadata.json not found for checkpoint {checkpoint_id}"],
+        }
+
+    try:
+        meta_data = json.loads(meta_raw)
+    except json.JSONDecodeError as e:
+        return {
+            "prompt_text": "",
+            "files_touched": [],
+            "complete": False,
+            "format_version": "a",
+            "warnings": [f"Failed to parse metadata.json: {e}"],
+        }
+
+    files_touched = meta_data.get("files_touched", [])
+    sessions = meta_data.get("sessions", [])
+
+    prompt_text = ""
+    if sessions:
+        prompt_raw = try_read_blob(repo_path, f"{cp_path}/0/prompt.txt")
+        if prompt_raw is None:
+            warnings.append("prompt.txt not found for session 0")
+        else:
+            prompt_text = prompt_raw
+
+    complete = bool(meta_raw and prompt_text)
 
     return {
-        "checkpoint_id": checkpoint_id,
-        "prompt": prompt,
-        "files_touched": meta.files_touched,
-        "session_count": len(meta.sessions),
-        "strategy": meta.strategy,
-        "branch": meta.branch,
-        "cli_version": meta.cli_version,
-        "session_id": session_meta.session_id if session_meta else "",
-        "agent": session_meta.agent if session_meta else "",
-        "created_at": session_meta.created_at if session_meta else "",
+        "prompt_text": prompt_text,
+        "files_touched": files_touched,
+        "complete": complete,
+        "format_version": "a",
+        "warnings": warnings,
     }
+
+
+def parse_format_b(commit_sha: str, repo_path: str) -> dict:
+    """Parse Format B: checkpoint.jsonl event stream."""
+    warnings = []
+    checkpoint_id = find_checkpoint_for_commit(commit_sha, repo_path)
+    if not checkpoint_id:
+        return {
+            "prompt_text": "",
+            "files_touched": [],
+            "complete": False,
+            "format_version": "b",
+            "warnings": ["No checkpoint found for commit"],
+        }
+
+    cp_path = checkpoint_path(checkpoint_id)
+    jsonl_raw = try_read_blob(repo_path, f"{cp_path}/checkpoint.jsonl")
+    if jsonl_raw is None:
+        return {
+            "prompt_text": "",
+            "files_touched": [],
+            "complete": False,
+            "format_version": "b",
+            "warnings": [f"checkpoint.jsonl not found for checkpoint {checkpoint_id}"],
+        }
+
+    prompt_parts = []
+    files_touched = set()
+    has_session_start = False
+    has_session_end = False
+
+    for line_num, line in enumerate(jsonl_raw.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            warnings.append(f"Line {line_num}: invalid JSON, skipping")
+            continue
+
+        event_type = event.get("event")
+        if event_type == "session_start":
+            has_session_start = True
+        elif event_type == "prompt":
+            text = event.get("text", "")
+            if text:
+                prompt_parts.append(text)
+        elif event_type == "file_edit":
+            path = event.get("path")
+            if path:
+                files_touched.add(path)
+        elif event_type == "session_end":
+            has_session_end = True
+        elif event_type == "tool_call":
+            pass
+        else:
+            warnings.append(f"Line {line_num}: unknown event type '{event_type}', skipped")
+
+    prompt_text = "\n".join(prompt_parts)
+    complete = has_session_start and has_session_end
+
+    if not has_session_start:
+        warnings.append("Missing session_start event")
+    if not has_session_end:
+        warnings.append("Missing session_end event, checkpoint may be incomplete")
+
+    return {
+        "prompt_text": prompt_text,
+        "files_touched": sorted(files_touched),
+        "complete": complete,
+        "format_version": "b",
+        "warnings": warnings,
+    }
+
+
+def get_checkpoint_for_commit(commit_sha: str, repo_path: str) -> Optional[dict]:
+    """
+    Get checkpoint data for a commit SHA.
+
+    Returns a dict with:
+    - prompt_text: the user prompt/intent text
+    - files_touched: list of file paths modified
+    - complete: bool, whether checkpoint data is complete
+    - format_version: "a" or "b"
+    - warnings: list of warning strings for any issues
+    Or None if no checkpoint found.
+    """
+    fmt = detect_format(commit_sha, repo_path)
+    if fmt is None:
+        return None
+
+    if fmt == "a":
+        return parse_format_a(commit_sha, repo_path)
+    else:
+        return parse_format_b(commit_sha, repo_path)
 
 
 def main():
@@ -252,7 +337,6 @@ def main():
     commit_sha = sys.argv[1]
     repo_path = sys.argv[2] if len(sys.argv) > 2 else "."
 
-    # Validate commit SHA format
     if len(commit_sha) < 7 or not all(c in "0123456789abcdef" for c in commit_sha.lower()):
         print(f"Error: Invalid commit SHA format: {commit_sha}", file=sys.stderr)
         sys.exit(1)
@@ -267,7 +351,6 @@ def main():
         print(f"No checkpoint found for commit {commit_sha}", file=sys.stderr)
         sys.exit(0)
 
-    # Output for GitHub Action consumption (JSON to stdout)
     print(json.dumps(result, indent=2))
 
 

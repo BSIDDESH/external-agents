@@ -37,6 +37,20 @@ cd pr-intent-bridge
 python extract_checkpoint.py <commit_sha> <repo_path>
 ```
 
+## Output Schema
+
+`extract_checkpoint.py` outputs JSON with the following keys:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `prompt_text` | string | The user prompt/intent text extracted from the checkpoint |
+| `files_touched` | array[string] | List of file paths modified in the checkpoint |
+| `complete` | boolean | Whether the checkpoint data is complete (has session_start and session_end for Format B, or metadata.json + prompt.txt for Format A) |
+| `format_version` | string | `"a"` for legacy metadata.json+prompt.txt format, `"b"` for new checkpoint.jsonl event stream format |
+| `warnings` | array[string] | Non-fatal warnings (missing data, unknown event types skipped, etc.) |
+
+**Note:** This schema changed from the previous version which used keys `prompt`, `checkpoint_id`, `session_count`, `strategy`, `branch`, `cli_version`, `session_id`, `agent`, `created_at`. The new schema is format-agnostic and focuses on the essential data needed for PR intent analysis.
+
 ## TODO (Track 3 follow-ups)
 
 - [ ] Post structured comment to PR using `gh api` or GitHub REST API
